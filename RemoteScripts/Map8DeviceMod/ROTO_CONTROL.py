@@ -205,6 +205,7 @@ class RotoControl(ControlSurface):
             self._meter_update_enabled = False
             self._expanded_devices_list = []
             self._mapr16_device_list = []
+            self._rotomap16_device_list = []
             self._mute_value_listener_list = {}
             self._mute_listener_list = []
             self._solo_value_listener_list = {}
@@ -605,6 +606,7 @@ class RotoControl(ControlSurface):
         selected_device = self.song().view.selected_track.view.selected_device
         if selected_device != None:
             self._log_print('Selected device: ' + str((selected_device.class_name, selected_device.name)))
+            self._log_print('ROTO_DIAG_SELECTED {}'.format(self._get_selected_device_diagnostic_summary(selected_device)))
             self._log_selected_device_diagnostics(selected_device)
         else:
             self._log_print('No device selected')
@@ -1399,44 +1401,69 @@ class RotoControl(ControlSurface):
         if not MAPR16_DIAGNOSTIC_LOGGING:
             return
 
+        try:
+            self._log_print('ROTO_DIAG_DEVICE {}'.format(self._get_selected_device_diagnostic_summary(device)))
+            self._log_print('ROTO_DIAG_DEVICE_ATTRS {}'.format(self._get_object_public_attribute_names(device)))
+
+            parameter_count = len(device.parameters)
+            self._log_print('ROTO_DIAG_PARAM_COUNT {}'.format(parameter_count))
+
+            parameter_names = []
+            focused_parameter_names = []
+            for index in range(parameter_count):
+                parameter = device.parameters[index]
+                original_name = getattr(parameter, 'original_name', '')
+                value_display = self._get_parameter_value_display(parameter)
+                parameter_name = '{}:{}|{}|{}'.format(index, parameter.name, original_name, value_display)
+                parameter_names.append(parameter_name)
+                if self._parameter_name_is_mapr16_diagnostic_candidate(parameter.name) or self._parameter_name_is_mapr16_diagnostic_candidate(original_name):
+                    focused_parameter_names.append(parameter_name)
+
+            self._log_print('ROTO_DIAG_FOCUSED_PARAMS {}'.format(' ; '.join(focused_parameter_names)))
+
+            chunk_size = 8
+            for chunk_start in range(0, len(parameter_names), chunk_size):
+                chunk = parameter_names[chunk_start:chunk_start + chunk_size]
+                self._log_print('ROTO_DIAG_PARAM_NAMES_{} {}'.format(chunk_start, ' ; '.join(chunk)))
+        except Exception as diagnostic_error:
+            self._log_print('ROTO_DIAG_ERROR {}'.format(diagnostic_error))
+
+    def _get_selected_device_diagnostic_summary(self, device):
         class_display_name = getattr(device, 'class_display_name', '')
         normalised_name = self._normalise_max_for_live_mapping_name(device.name)
         normalised_class_display_name = self._normalise_max_for_live_mapping_name(class_display_name)
         mapping_name = self._get_device_mapping_name(device)
-        self._log_print('ROTO_DIAG_DEVICE name="{}" class_name="{}" class_display_name="{}" normalised_name="{}" normalised_class_display_name="{}" mapping_name="{}" is_m4l={} is_map8={} is_mapr16={}'.format(
+        parameter_names = self._get_device_parameter_names(device)
+        has_macro_a_controls = self._parameter_names_contain_series(parameter_names, 'MacroA', 1, 8, False)
+        has_macro_b_controls = self._parameter_names_contain_series(parameter_names, 'MacroB', 1, 8, False)
+        return 'name="{}" class_name="{}" class_display_name="{}" normalised_name="{}" normalised_class_display_name="{}" mapping_name="{}" parameter_count={} has_macro_a={} has_macro_b={} is_m4l={} is_map8={} is_mapr16={} is_rotomap16={}'.format(
             device.name,
             device.class_name,
             class_display_name,
             normalised_name,
             normalised_class_display_name,
             mapping_name,
+            len(device.parameters),
+            has_macro_a_controls,
+            has_macro_b_controls,
             self._device_is_max_for_live(device.class_name),
             self._device_is_map8(device),
-            self._device_is_mapr16(device)))
-
-        parameter_count = len(device.parameters)
-        self._log_print('ROTO_DIAG_PARAM_COUNT {}'.format(parameter_count))
-
-        parameter_names = []
-        focused_parameter_names = []
-        for index in range(parameter_count):
-            parameter = device.parameters[index]
-            original_name = getattr(parameter, 'original_name', '')
-            parameter_name = '{}:{}|{}'.format(index, parameter.name, original_name)
-            parameter_names.append(parameter_name)
-            if self._parameter_name_is_mapr16_diagnostic_candidate(parameter.name) or self._parameter_name_is_mapr16_diagnostic_candidate(original_name):
-                focused_parameter_names.append(parameter_name)
-
-        self._log_print('ROTO_DIAG_FOCUSED_PARAMS {}'.format(' ; '.join(focused_parameter_names)))
-
-        chunk_size = 16
-        for chunk_start in range(0, len(parameter_names), chunk_size):
-            chunk = parameter_names[chunk_start:chunk_start + chunk_size]
-            self._log_print('ROTO_DIAG_PARAM_NAMES_{} {}'.format(chunk_start, ' ; '.join(chunk)))
+            self._device_is_mapr16(device),
+            self._device_is_rotomap16(device))
 
     def _parameter_name_is_mapr16_diagnostic_candidate(self, parameter_name):
         parameter_name = parameter_name.lower()
         return ('macro' in parameter_name) or ('textedit' in parameter_name) or ('map' in parameter_name) or ('patch' in parameter_name) or ('axis' in parameter_name) or ('curve' in parameter_name) or ('reset' in parameter_name)
+
+    def _get_object_public_attribute_names(self, obj):
+        try:
+            attribute_names = []
+            for attribute_name in dir(obj):
+                if not attribute_name.startswith('_'):
+                    attribute_names.append(attribute_name)
+            return ','.join(attribute_names)
+        except:
+            return ''
 
     # MIDI receiver - process MIDI commands we are interested in intercepting and pass on
     # the rest to Ableton Live.
@@ -2043,6 +2070,8 @@ class RotoControl(ControlSurface):
     def _get_device_mapping_name(self, device):
         if self._device_is_map8(device):
             return 'Map8'
+        if self._device_is_rotomap16(device):
+            return 'RotoMap16'
         if self._device_is_mapr16(device):
             return 'Mapr16'
         return device.name
@@ -2062,6 +2091,10 @@ class RotoControl(ControlSurface):
         slot = self._get_mapr16_parameter_slot(parameter)
         if slot == None:
             return None
+
+        stable_parameter_name = 'Macro{}{}'.format(slot[0], slot[1])
+        if parameter.name != stable_parameter_name:
+            return parameter.name
 
         name_parameter = self._get_mapr16_name_parameter(device, slot)
         if name_parameter != None:
@@ -2213,6 +2246,26 @@ class RotoControl(ControlSurface):
                 return True
         return False
 
+    def _device_is_rotomap16(self, device):
+        if self._device_is_cached_rotomap16(device):
+            return True
+
+        if self._device_is_max_for_live(device.class_name):
+            device_name = self._normalise_max_for_live_mapping_name(device.name)
+            if device_name.lower() == 'rotomap16':
+                self._remember_rotomap16_device(device)
+                return True
+
+            parameter_names = self._get_device_parameter_names(device)
+            has_bypasses = self._parameter_names_contain_series(parameter_names, 'Bypass ', 1, 8, False)
+            has_map_controls = parameter_names.count('Map') >= 32
+            has_max_controls = parameter_names.count('Max 1') >= 16
+            has_min_controls = parameter_names.count('Min 1') >= 16
+            if has_bypasses and has_map_controls and has_max_controls and has_min_controls:
+                self._remember_rotomap16_device(device)
+                return True
+        return False
+
     def _device_is_cached_mapr16(self, device):
         for mapr16_device in self._mapr16_device_list:
             if device == mapr16_device:
@@ -2222,6 +2275,16 @@ class RotoControl(ControlSurface):
     def _remember_mapr16_device(self, device):
         if not self._device_is_cached_mapr16(device):
             self._mapr16_device_list.append(device)
+
+    def _device_is_cached_rotomap16(self, device):
+        for rotomap16_device in self._rotomap16_device_list:
+            if device == rotomap16_device:
+                return True
+        return False
+
+    def _remember_rotomap16_device(self, device):
+        if not self._device_is_cached_rotomap16(device):
+            self._rotomap16_device_list.append(device)
 
     def _get_device_parameter_names(self, device):
         parameter_names = []
