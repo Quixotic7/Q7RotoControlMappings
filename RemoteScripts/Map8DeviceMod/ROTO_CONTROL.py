@@ -32,6 +32,7 @@ LOG_OFF = 1000
 LOG_BASIC = 1
 LOG_VERBOSE = 2
 LOG_PRINT_LEVEL = LOG_BASIC
+MAPR16_DIAGNOSTIC_LOGGING = False
 
 # System constants
 MIDI_CHANNEL = 15
@@ -203,6 +204,7 @@ class RotoControl(ControlSurface):
             self._select_device_start_time = 0
             self._meter_update_enabled = False
             self._expanded_devices_list = []
+            self._mapr16_device_list = []
             self._mute_value_listener_list = {}
             self._mute_listener_list = []
             self._solo_value_listener_list = {}
@@ -603,6 +605,7 @@ class RotoControl(ControlSurface):
         selected_device = self.song().view.selected_track.view.selected_device
         if selected_device != None:
             self._log_print('Selected device: ' + str((selected_device.class_name, selected_device.name)))
+            self._log_selected_device_diagnostics(selected_device)
         else:
             self._log_print('No device selected')
 
@@ -1010,7 +1013,11 @@ class RotoControl(ControlSurface):
         else:
             return False
 
-    def _get_learn_name(self, param, device_is_learnt_rack = False):
+    def _get_learn_name(self, param, device_is_learnt_rack = False, device = None):
+        if (device != None) and self._device_is_mapr16(device):
+            mapr16_name = self._get_mapr16_stable_parameter_name(param)
+            if mapr16_name:
+                return mapr16_name
         if self._is_macro(param) and (device_is_learnt_rack == False):
             return param.original_name
         else:
@@ -1186,12 +1193,12 @@ class RotoControl(ControlSurface):
                     quantised_strings = bytes(len(parameter.value_items) * MAX_STRING_LENGTH)
 
             # Truncate the parameter name if needed
-            param_name = parameter.name[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
+            param_name = self._get_parameter_display_name(parameter, selected_device)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
             # Get a hash (6 bytes) of the original name
             index_msb = (index & 0x3f80) >> 7
             index_lsb = index & 0x7f
 
-            param_learn_name = self._get_learn_name(parameter)
+            param_learn_name = self._get_learn_name(parameter, False, selected_device)
 
             macro_byte = 0
             param_value_14b = int(16383 * ((parameter.value - parameter.min) / (parameter.max - parameter.min)))
@@ -1235,12 +1242,12 @@ class RotoControl(ControlSurface):
                 return
 
             # Create the data structure to return to the device
-            param_name = parameter.name[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
+            param_name = self._get_parameter_display_name(parameter, selected_device)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
             # Get a hash (6 bytes) of the original name
             index_msb = (index & 0x3f80) >> 7
             index_lsb = index & 0x7f
 
-            param_learn_name = self._get_learn_name(parameter)
+            param_learn_name = self._get_learn_name(parameter, False, selected_device)
 
             plugin_digest = self._get_param_hash(param_learn_name)
             data = bytearray([index_msb, index_lsb])
@@ -1387,6 +1394,49 @@ class RotoControl(ControlSurface):
         # Only run this if the selected device is a rack to avoid unneccessary updates
         if self._device_is_macro_rack(self._get_selected_device().class_name):
             self.__on_selected_device_changed()
+
+    def _log_selected_device_diagnostics(self, device):
+        if not MAPR16_DIAGNOSTIC_LOGGING:
+            return
+
+        class_display_name = getattr(device, 'class_display_name', '')
+        normalised_name = self._normalise_max_for_live_mapping_name(device.name)
+        normalised_class_display_name = self._normalise_max_for_live_mapping_name(class_display_name)
+        mapping_name = self._get_device_mapping_name(device)
+        self._log_print('ROTO_DIAG_DEVICE name="{}" class_name="{}" class_display_name="{}" normalised_name="{}" normalised_class_display_name="{}" mapping_name="{}" is_m4l={} is_map8={} is_mapr16={}'.format(
+            device.name,
+            device.class_name,
+            class_display_name,
+            normalised_name,
+            normalised_class_display_name,
+            mapping_name,
+            self._device_is_max_for_live(device.class_name),
+            self._device_is_map8(device),
+            self._device_is_mapr16(device)))
+
+        parameter_count = len(device.parameters)
+        self._log_print('ROTO_DIAG_PARAM_COUNT {}'.format(parameter_count))
+
+        parameter_names = []
+        focused_parameter_names = []
+        for index in range(parameter_count):
+            parameter = device.parameters[index]
+            original_name = getattr(parameter, 'original_name', '')
+            parameter_name = '{}:{}|{}'.format(index, parameter.name, original_name)
+            parameter_names.append(parameter_name)
+            if self._parameter_name_is_mapr16_diagnostic_candidate(parameter.name) or self._parameter_name_is_mapr16_diagnostic_candidate(original_name):
+                focused_parameter_names.append(parameter_name)
+
+        self._log_print('ROTO_DIAG_FOCUSED_PARAMS {}'.format(' ; '.join(focused_parameter_names)))
+
+        chunk_size = 16
+        for chunk_start in range(0, len(parameter_names), chunk_size):
+            chunk = parameter_names[chunk_start:chunk_start + chunk_size]
+            self._log_print('ROTO_DIAG_PARAM_NAMES_{} {}'.format(chunk_start, ' ; '.join(chunk)))
+
+    def _parameter_name_is_mapr16_diagnostic_candidate(self, parameter_name):
+        parameter_name = parameter_name.lower()
+        return ('macro' in parameter_name) or ('textedit' in parameter_name) or ('map' in parameter_name) or ('patch' in parameter_name) or ('axis' in parameter_name) or ('curve' in parameter_name) or ('reset' in parameter_name)
 
     # MIDI receiver - process MIDI commands we are interested in intercepting and pass on
     # the rest to Ableton Live.
@@ -1589,7 +1639,7 @@ class RotoControl(ControlSurface):
 
                     param_hash_list = []
                     for ix in range(len(selected_device.parameters)):
-                        param_learn_name = self._get_learn_name(selected_device.parameters[ix], device_is_learnt_rack)
+                        param_learn_name = self._get_learn_name(selected_device.parameters[ix], device_is_learnt_rack, selected_device)
                         plugin_digest = self._get_param_hash(param_learn_name)
                         param_hash_list.append(plugin_digest)
 
@@ -1628,6 +1678,14 @@ class RotoControl(ControlSurface):
                             param = selected_device.parameters[param_index]
 
                             # Send the position data for knobs
+                            if (param != None) and (data[8] == 0):
+                                self._learn_parameter(param, selected_device, param_index_original, False, param_hash)
+                        elif self._device_is_mapr16(selected_device) and (param_index < len(selected_device.parameters)):
+                            param = selected_device.parameters[param_index]
+
+                            # Mapr16 supports custom macro labels. If the visible name changed and
+                            # Live does not expose the original name, the stored hash can fail even
+                            # though the parameter index is still valid.
                             if (param != None) and (data[8] == 0):
                                 self._learn_parameter(param, selected_device, param_index_original, False, param_hash)
                         else:
@@ -1985,7 +2043,124 @@ class RotoControl(ControlSurface):
     def _get_device_mapping_name(self, device):
         if self._device_is_map8(device):
             return 'Map8'
+        if self._device_is_mapr16(device):
+            return 'Mapr16'
         return device.name
+
+    def _get_parameter_display_name(self, parameter, device):
+        if self._device_is_map8(device):
+            map8_name = self._get_map8_parameter_display_name(parameter, device)
+            if map8_name:
+                return map8_name
+        if self._device_is_mapr16(device):
+            mapr16_name = self._get_mapr16_parameter_display_name(parameter, device)
+            if mapr16_name:
+                return mapr16_name
+        return parameter.name
+
+    def _get_mapr16_parameter_display_name(self, parameter, device):
+        slot = self._get_mapr16_parameter_slot(parameter)
+        if slot == None:
+            return None
+
+        name_parameter = self._get_mapr16_name_parameter(device, slot)
+        if name_parameter != None:
+            parameter_name = self._get_parameter_value_display(name_parameter)
+            if self._is_usable_mapr16_custom_name(parameter_name, slot):
+                return parameter_name
+
+        return parameter.name
+
+    def _get_mapr16_stable_parameter_name(self, parameter):
+        slot = self._get_mapr16_parameter_slot(parameter)
+        if slot == None:
+            return None
+        return 'Macro{}{}'.format(slot[0], slot[1])
+
+    def _get_mapr16_name_parameter(self, device, slot):
+        textedit_name = 'textedit{}{}'.format(slot[0].lower(), slot[1])
+        for parameter in device.parameters:
+            for parameter_name in self._get_parameter_names(parameter):
+                if parameter_name == textedit_name:
+                    return parameter
+                if re.match(r'^{}\[\d+\]$'.format(textedit_name), parameter_name):
+                    return parameter
+        return None
+
+    def _get_mapr16_parameter_slot(self, parameter):
+        for parameter_name in self._get_parameter_names(parameter):
+            match = re.match(r'^Macro([AB])([1-8])$', parameter_name)
+            if match:
+                return (match.group(1), int(match.group(2)))
+
+            match = re.match(r'^textedit([ab])([1-8])(?:\[\d+\])?$', parameter_name)
+            if match:
+                return (match.group(1).upper(), int(match.group(2)))
+
+        return None
+
+    def _is_usable_mapr16_custom_name(self, parameter_name, slot):
+        if not parameter_name:
+            return False
+
+        lower_parameter_name = parameter_name.lower()
+        if lower_parameter_name == 'textedit{}{}'.format(slot[0].lower(), slot[1]):
+            return False
+        if lower_parameter_name == 'macro{}{}'.format(slot[0].lower(), slot[1]):
+            return False
+        if re.match(r'^-?\d+(?:\.\d+)?$', parameter_name):
+            return False
+
+        return True
+
+    def _get_parameter_value_display(self, parameter):
+        try:
+            return parameter.str_for_value(parameter.value).rstrip('\x00').strip()
+        except:
+            return ''
+
+    def _get_map8_parameter_display_name(self, parameter, device):
+        slot = self._get_map8_parameter_slot(parameter)
+        if slot == None:
+            return None
+
+        macro_parameter = self._get_map8_macro_parameter(device, slot)
+        if macro_parameter != None:
+            generic_macro_name = 'Macro {}'.format(slot)
+            if macro_parameter.name != generic_macro_name:
+                return macro_parameter.name
+
+        return parameter.name
+
+    def _get_map8_macro_parameter(self, device, slot):
+        generic_macro_name = 'Macro {}'.format(slot)
+        for parameter in device.parameters:
+            if parameter.name == generic_macro_name:
+                return parameter
+            original_name = getattr(parameter, 'original_name', '')
+            if original_name == generic_macro_name:
+                return parameter
+        return None
+
+    def _get_map8_parameter_slot(self, parameter):
+        for parameter_name in self._get_parameter_names(parameter):
+            match = re.match(r'^Macro ([1-8])$', parameter_name)
+            if match:
+                return int(match.group(1))
+
+            match = re.match(r'^Bypass ([1-8])$', parameter_name)
+            if match:
+                return int(match.group(1))
+
+            match = re.match(r'^Curve([1-8])$', parameter_name)
+            if match:
+                return int(match.group(1))
+
+            match = re.match(r'^(Map|Min|Max|Unmap)\[([1-8])\]$', parameter_name)
+            if match:
+                return int(match.group(2))
+
+        return None
 
     def _device_is_map8(self, device):
         if self._device_is_max_for_live(device.class_name):
@@ -2004,28 +2179,98 @@ class RotoControl(ControlSurface):
                 return True
         return False
 
+    def _device_is_mapr16(self, device):
+        if self._device_is_cached_mapr16(device):
+            return True
+
+        class_display_name = getattr(device, 'class_display_name', '')
+        if class_display_name:
+            class_display_name = self._normalise_max_for_live_mapping_name(class_display_name)
+            if class_display_name.lower() == 'mapr16':
+                self._remember_mapr16_device(device)
+                return True
+
+        if self._device_is_max_for_live(device.class_name):
+            device_name = self._normalise_max_for_live_mapping_name(device.name)
+            if device_name.lower() == 'mapr16':
+                self._remember_mapr16_device(device)
+                return True
+
+            parameter_names = self._get_device_parameter_names(device)
+            has_macro_a_controls = self._parameter_names_contain_series(parameter_names, 'MacroA', 1, 8, False)
+            has_macro_b_controls = self._parameter_names_contain_series(parameter_names, 'MacroB', 1, 8, False)
+            has_name_a_controls = self._parameter_names_contain_series(parameter_names, 'textedita', 1, 8, False)
+            name_b_control_count = self._parameter_names_series_count(parameter_names, 'texteditb', 1, 8, False)
+            has_name_b_controls = name_b_control_count >= 7
+            if has_macro_a_controls and has_macro_b_controls and self._device_parameter_names_match_mapr16(parameter_names):
+                self._remember_mapr16_device(device)
+                return True
+            if has_macro_a_controls and has_macro_b_controls and has_name_a_controls and has_name_b_controls:
+                self._remember_mapr16_device(device)
+                return True
+            if has_name_a_controls and has_name_b_controls and self._device_parameter_names_match_mapr16(parameter_names):
+                self._remember_mapr16_device(device)
+                return True
+        return False
+
+    def _device_is_cached_mapr16(self, device):
+        for mapr16_device in self._mapr16_device_list:
+            if device == mapr16_device:
+                return True
+        return False
+
+    def _remember_mapr16_device(self, device):
+        if not self._device_is_cached_mapr16(device):
+            self._mapr16_device_list.append(device)
+
     def _get_device_parameter_names(self, device):
         parameter_names = []
         for parameter in device.parameters:
-            parameter_names.append(parameter.name)
-            original_name = getattr(parameter, 'original_name', '')
-            if original_name:
-                parameter_names.append(original_name)
+            parameter_names.extend(self._get_parameter_names(parameter))
+        return parameter_names
+
+    def _get_parameter_names(self, parameter):
+        parameter_names = [parameter.name]
+        original_name = getattr(parameter, 'original_name', '')
+        if original_name:
+            parameter_names.append(original_name)
         return parameter_names
 
     def _parameter_names_contain_series(self, parameter_names, prefix, start, end, bracketed):
+        return self._parameter_names_series_count(parameter_names, prefix, start, end, bracketed) == ((end - start) + 1)
+
+    def _parameter_names_series_count(self, parameter_names, prefix, start, end, bracketed):
+        count = 0
         for index in range(start, end + 1):
             if bracketed:
                 parameter_name = '{}[{}]'.format(prefix, index)
             else:
                 parameter_name = '{}{}'.format(prefix, index)
-            if parameter_name not in parameter_names:
-                return False
-        return True
+            if parameter_name in parameter_names:
+                count += 1
+        return count
+
+    def _device_parameter_names_match_mapr16(self, parameter_names):
+        mapr16_parameter_names = [
+            'Clear All',
+            'Clear',
+            'Load',
+            'Preset',
+            'Random',
+            'Reset',
+            'Save',
+            'X-Axis',
+            'Y-Axis'
+        ]
+        matched_parameter_names = 0
+        for parameter_name in mapr16_parameter_names:
+            if parameter_name in parameter_names:
+                matched_parameter_names += 1
+        return matched_parameter_names >= 3
 
     def _normalise_max_for_live_mapping_name(self, device_name):
         device_name = re.sub(r'\.amxd$', '', device_name, flags=re.IGNORECASE)
-        device_name = re.sub(r' \d+$', '', device_name)
+        device_name = re.sub(r' \d+(?:\.\d+)*$', '', device_name)
         return re.sub(r'\.amxd$', '', device_name, flags=re.IGNORECASE)
 
     def _device_is_max_for_live(self, class_name):
