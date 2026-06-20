@@ -1930,7 +1930,12 @@ class RotoControl(ControlSurface):
                 plugin_digest = bytearray()
                 device = devices[self._plugin_first_device + ix]
                 mapping_name = self._get_device_mapping_name(device)
-                if self._device_is_macro_rack(plugin_names_list[ix][PLUGIN_CLASS_NAME_INDEX]) and self._rack_has_default_name(plugin_names_list[ix][PLUGIN_NAME_INDEX]):
+                plugin_display_name = plugin_names_list[ix][PLUGIN_NAME_INDEX]
+                if self._device_has_mapping_override(device):
+                    plugin_digest.extend(self._get_plugin_hash((plugin_names_list[ix][PLUGIN_CLASS_NAME_INDEX] + mapping_name).encode('utf-8'), 4))
+                    plugin_digest.extend(self._get_plugin_hash((mapping_name + plugin_names_list[ix][PLUGIN_CLASS_NAME_INDEX]).encode('utf-8'), 4))
+                    plugin_display_name = mapping_name
+                elif self._device_is_macro_rack(plugin_names_list[ix][PLUGIN_CLASS_NAME_INDEX]) and self._rack_has_default_name(plugin_names_list[ix][PLUGIN_NAME_INDEX]):
                     plugin_digest.extend(self._get_plugin_hash(MACRO_DEVICE_NAME.encode('utf-8'), 8))
                 elif self._device_supports_preset_recall(plugin_names_list[ix][PLUGIN_CLASS_NAME_INDEX]):
                     plugin_digest.extend(self._get_plugin_hash((plugin_names_list[ix][PLUGIN_CLASS_NAME_INDEX]).encode('utf-8'), 8))
@@ -1948,7 +1953,7 @@ class RotoControl(ControlSurface):
                 data = bytearray([self._plugin_first_device + ix])
                 data.extend(plugin_digest)
                 data.append(enabled)
-                data.extend(plugin_names_list[ix][PLUGIN_NAME_INDEX][:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00').encode('utf-8'))
+                data.extend(plugin_display_name[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00').encode('utf-8'))
                 data.append(rack_device)
                 data.append(MACRO_PLUGIN_PAGES)
                 self._send_sysex(PLUGIN_COMMAND_GROUP, PLUGIN_DETAILS, data)
@@ -2068,6 +2073,9 @@ class RotoControl(ControlSurface):
         return device_name not in UNIQUE_DEVICE_CLASS_NAMES
 
     def _get_device_mapping_name(self, device):
+        mapping_override_name = self._get_device_mapping_override_name(device)
+        if mapping_override_name:
+            return mapping_override_name
         if self._device_is_map8(device):
             return 'Map8'
         if self._device_is_rotomap16(device):
@@ -2076,16 +2084,111 @@ class RotoControl(ControlSurface):
             return 'Mapr16'
         return device.name
 
+    def _get_device_mapping_override_name(self, device):
+        for parameter in device.parameters:
+            for parameter_name in self._get_parameter_names(parameter):
+                match = re.match(r'^RotoMap_(.+)$', parameter_name)
+                if match:
+                    mapping_name = match.group(1).strip()
+                    if mapping_name:
+                        return self._normalise_max_for_live_mapping_name(mapping_name)
+        return None
+
+    def _device_has_mapping_override(self, device):
+        return self._get_device_mapping_override_name(device) != None
+
     def _get_parameter_display_name(self, parameter, device):
+        mapping_override_name = self._get_parameter_mapping_override_name(parameter)
+        if mapping_override_name:
+            return mapping_override_name
         if self._device_is_map8(device):
             map8_name = self._get_map8_parameter_display_name(parameter, device)
             if map8_name:
                 return map8_name
+        if self._device_is_rotomap16(device):
+            rotomap16_name = self._get_rotomap16_parameter_display_name(parameter, device)
+            if rotomap16_name:
+                return rotomap16_name
         if self._device_is_mapr16(device):
             mapr16_name = self._get_mapr16_parameter_display_name(parameter, device)
             if mapr16_name:
                 return mapr16_name
         return parameter.name
+
+    def _get_parameter_mapping_override_name(self, parameter):
+        for parameter_name in self._get_parameter_names(parameter):
+            match = re.match(r'^RotoMap_(.+)$', parameter_name)
+            if match:
+                return match.group(1).strip()
+        return None
+
+    def _get_rotomap16_parameter_display_name(self, parameter, device):
+        slot = self._get_rotomap16_parameter_slot(parameter, device)
+        if slot == None:
+            return None
+
+        name_parameter = self._get_rotomap16_name_parameter(device, slot)
+        if name_parameter != None:
+            if self._is_usable_rotomap16_custom_name(name_parameter.name, slot):
+                return name_parameter.name
+
+            parameter_name = self._get_parameter_value_display(name_parameter)
+            if self._is_usable_rotomap16_custom_name(parameter_name, slot):
+                return parameter_name
+
+        return parameter.name
+
+    def _get_rotomap16_name_parameter(self, device, slot):
+        expected_names = [
+            'macroname{}'.format(slot),
+            'macro name {}'.format(slot),
+            'macro_name_{}'.format(slot)
+        ]
+        for parameter in device.parameters:
+            for parameter_name in self._get_parameter_names(parameter):
+                if parameter_name.lower() in expected_names:
+                    return parameter
+        return None
+
+    def _get_rotomap16_parameter_slot(self, parameter, device):
+        parameter_index = self._get_device_parameter_index(parameter, device)
+        if parameter_index == None:
+            return None
+
+        # RotoMap16 exposes the 16 macro dials as the first block of repeated
+        # "Map" parameters, then another 16 curve "Map" parameters, then max/min.
+        if (parameter_index >= 17) and (parameter_index <= 32):
+            return (parameter_index - 16)
+        if (parameter_index >= 33) and (parameter_index <= 48):
+            return (parameter_index - 32)
+        if (parameter_index >= 49) and (parameter_index <= 64):
+            return (parameter_index - 48)
+        if (parameter_index >= 65) and (parameter_index <= 80):
+            return (parameter_index - 64)
+        if (parameter_index >= 1) and (parameter_index <= 8):
+            return parameter_index
+        if (parameter_index >= 9) and (parameter_index <= 15):
+            return (parameter_index + 1)
+        if parameter_index == 16:
+            return 9
+
+        return None
+
+    def _is_usable_rotomap16_custom_name(self, parameter_name, slot):
+        if not parameter_name:
+            return False
+
+        lower_parameter_name = parameter_name.lower()
+        if lower_parameter_name in ['macroname{}'.format(slot), 'macro name {}'.format(slot), 'macro_name_{}'.format(slot)]:
+            return False
+        if lower_parameter_name in ['map', 'max 1', 'min 1', 'bypass {}'.format(((slot - 1) % 8) + 1)]:
+            return False
+        if lower_parameter_name in ['off', 'on']:
+            return False
+        if re.match(r'^-?\d+(?:\.\d+)?(?: ?%)?$', parameter_name):
+            return False
+
+        return True
 
     def _get_mapr16_parameter_display_name(self, parameter, device):
         slot = self._get_mapr16_parameter_slot(parameter)
@@ -2291,6 +2394,12 @@ class RotoControl(ControlSurface):
         for parameter in device.parameters:
             parameter_names.extend(self._get_parameter_names(parameter))
         return parameter_names
+
+    def _get_device_parameter_index(self, parameter, device):
+        for index in range(len(device.parameters)):
+            if parameter == device.parameters[index]:
+                return index
+        return None
 
     def _get_parameter_names(self, parameter):
         parameter_names = [parameter.name]
