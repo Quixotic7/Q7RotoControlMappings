@@ -1228,9 +1228,14 @@ class RotoControl(ControlSurface):
             # Form strings into the format to send back:
             #   Up to MAX_QUANTISED_STRING_STEPS strings can be sent back
             #   Unused strings, or steps greater than MAX_QUANTISED_STRING_STEPS are sent back as an empty string
-            quantised_strings = ''
+            quantised_strings = bytearray()
             quantised_steps = 0
-            if parameter.is_quantized:
+            haptic_step_count = self._get_parameter_haptic_step_count(parameter, display_name_override)
+            if haptic_step_count != None:
+                quantised_steps = haptic_step_count
+                if quantised_steps <= MAX_QUANTISED_STRING_STEPS:
+                    quantised_strings = bytes(quantised_steps * MAX_STRING_LENGTH)
+            elif parameter.is_quantized:
                 quantised_steps = min([len(parameter.value_items), MAX_QUANTISED_STEPS])
 
                 # Send zero filled strings - strings are obtained live.
@@ -1239,7 +1244,7 @@ class RotoControl(ControlSurface):
 
             # Truncate the parameter name if needed
             if display_name_override:
-                param_name = display_name_override[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
+                param_name = self._remove_haptic_step_suffix(display_name_override)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
             else:
                 param_name = self._get_parameter_display_name(parameter, selected_device)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
             # Get a hash (6 bytes) of the original name
@@ -1271,6 +1276,8 @@ class RotoControl(ControlSurface):
             self._send_sysex(PLUGIN_COMMAND_GROUP, LEARN_PARAM, data)
             if display_name_override:
                 self._log_print('ROTO_DIAG_LEARN_PARAM_NAME name="{}" index={} macro_byte={}'.format(display_name_override, index, macro_byte))
+            if haptic_step_count != None:
+                self._log_print('ROTO_DIAG_HAPTIC_STEPS name="{}" steps={} index={}'.format(self._remove_haptic_step_suffix(display_name_override if display_name_override else parameter.name), haptic_step_count, index))
         else:
             self._log_print('No parameter selected')
 
@@ -1296,7 +1303,7 @@ class RotoControl(ControlSurface):
 
             # Create the data structure to return to the device
             if display_name_override:
-                param_name = display_name_override[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
+                param_name = self._remove_haptic_step_suffix(display_name_override)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
             else:
                 param_name = self._get_parameter_display_name(parameter, selected_device)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
             # Get a hash (6 bytes) of the original name
@@ -2181,26 +2188,41 @@ class RotoControl(ControlSurface):
         if self._device_is_map8(device):
             map8_name = self._get_map8_parameter_display_name(parameter, device)
             if map8_name:
-                return map8_name
+                return self._remove_haptic_step_suffix(map8_name)
         if self._device_is_rotomap16(device):
             rotomap16_name = self._get_rotomap16_parameter_display_name(parameter, device)
             if rotomap16_name:
-                return rotomap16_name
+                return self._remove_haptic_step_suffix(rotomap16_name)
         if self._device_is_mapr16(device):
             mapr16_name = self._get_mapr16_parameter_display_name(parameter, device)
             if mapr16_name:
-                return mapr16_name
-        return parameter.name
+                return self._remove_haptic_step_suffix(mapr16_name)
+        return self._remove_haptic_step_suffix(parameter.name)
 
     def _get_parameter_mapping_override_name(self, parameter):
         for parameter_name in self._get_parameter_names(parameter):
             match = re.match(r'^RotoMap_(.+)$', parameter_name)
             if match:
-                return match.group(1).strip()
+                return self._remove_haptic_step_suffix(match.group(1).strip())
             match = re.match(r'^RotoParam(?:[1-9]|1[0-6])(?:_| )(.+)$', parameter_name)
             if match:
-                return match.group(1).strip()
+                return self._remove_haptic_step_suffix(match.group(1).strip())
         return None
+
+    def _get_parameter_haptic_step_count(self, parameter, display_name_override = None):
+        parameter_names = []
+        if display_name_override:
+            parameter_names.append(display_name_override)
+        parameter_names.extend(self._get_parameter_names(parameter))
+
+        for parameter_name in parameter_names:
+            match = re.search(r'_Step([2-9]|1[0-9]|2[0-4])$', parameter_name, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+        return None
+
+    def _remove_haptic_step_suffix(self, parameter_name):
+        return re.sub(r'_Step(?:[2-9]|1[0-9]|2[0-4])$', '', parameter_name, flags=re.IGNORECASE).strip()
 
     def _get_roto_param_slot(self, control_type, control_index):
         if control_type == 0:
@@ -2218,13 +2240,13 @@ class RotoControl(ControlSurface):
             for parameter_name in self._get_parameter_names(parameter):
                 match = re.match(r'^RotoParam{}(?:_| )(.+)$'.format(slot), parameter_name)
                 if match:
-                    display_name = match.group(1).strip()
+                    display_name = self._remove_haptic_step_suffix(match.group(1).strip())
                     if display_name:
                         return display_name
                 if parameter_name == 'RotoParam{}'.format(slot):
                     display_name = self._get_parameter_value_display(parameter)
                     if display_name:
-                        return display_name
+                        return self._remove_haptic_step_suffix(display_name)
         return None
 
     def _get_rotomap16_parameter_display_name(self, parameter, device):
