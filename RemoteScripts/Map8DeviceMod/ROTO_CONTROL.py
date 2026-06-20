@@ -112,7 +112,8 @@ PARAM_INDEX_NO_OVERRIDE = 0xFFFF
 PARAM_HASH_NO_OVERRIDE = 0xFFFFFFFF
 MACRO_PLUGIN_PAGES = 0
 MACRO_FORCE_PLUGIN = 0
-HAPTIC_CENTER_INDENT = 0
+HAPTIC_NO_CENTER_INDENT = 0
+HAPTIC_CENTER_INDENT = 1
 TOUCH_FIRST_CC = 52
 DEFAULT_VOLUME_CC = 64
 METERS_FIRST_CC = 65
@@ -1231,6 +1232,7 @@ class RotoControl(ControlSurface):
             quantised_strings = bytearray()
             quantised_steps = 0
             haptic_step_count = self._get_parameter_haptic_step_count(parameter, display_name_override)
+            haptic_center_indent = HAPTIC_CENTER_INDENT if self._parameter_has_haptic_center_indent(parameter, display_name_override) else HAPTIC_NO_CENTER_INDENT
             if haptic_step_count != None:
                 quantised_steps = haptic_step_count
                 if quantised_steps <= MAX_QUANTISED_STRING_STEPS:
@@ -1244,7 +1246,7 @@ class RotoControl(ControlSurface):
 
             # Truncate the parameter name if needed
             if display_name_override:
-                param_name = self._remove_haptic_step_suffix(display_name_override)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
+                param_name = self._remove_haptic_suffixes(display_name_override)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
             else:
                 param_name = self._get_parameter_display_name(parameter, selected_device)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
             # Get a hash (6 bytes) of the original name
@@ -1267,7 +1269,7 @@ class RotoControl(ControlSurface):
             data = bytearray([index_msb, index_lsb])
             data.extend(plugin_digest)
             data.append(macro_byte)
-            data.append(HAPTIC_CENTER_INDENT)
+            data.append(haptic_center_indent)
             data.append(quantised_steps)
             data.append(param_value_msb)
             data.append(param_value_lsb)
@@ -1277,7 +1279,9 @@ class RotoControl(ControlSurface):
             if display_name_override:
                 self._log_print('ROTO_DIAG_LEARN_PARAM_NAME name="{}" index={} macro_byte={}'.format(display_name_override, index, macro_byte))
             if haptic_step_count != None:
-                self._log_print('ROTO_DIAG_HAPTIC_STEPS name="{}" steps={} index={}'.format(self._remove_haptic_step_suffix(display_name_override if display_name_override else parameter.name), haptic_step_count, index))
+                self._log_print('ROTO_DIAG_HAPTIC_STEPS name="{}" steps={} index={}'.format(self._remove_haptic_suffixes(display_name_override if display_name_override else parameter.name), haptic_step_count, index))
+            if haptic_center_indent == HAPTIC_CENTER_INDENT:
+                self._log_print('ROTO_DIAG_HAPTIC_CENTER name="{}" index={}'.format(self._remove_haptic_suffixes(display_name_override if display_name_override else parameter.name), index))
         else:
             self._log_print('No parameter selected')
 
@@ -1303,7 +1307,7 @@ class RotoControl(ControlSurface):
 
             # Create the data structure to return to the device
             if display_name_override:
-                param_name = self._remove_haptic_step_suffix(display_name_override)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
+                param_name = self._remove_haptic_suffixes(display_name_override)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
             else:
                 param_name = self._get_parameter_display_name(parameter, selected_device)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
             # Get a hash (6 bytes) of the original name
@@ -2188,25 +2192,25 @@ class RotoControl(ControlSurface):
         if self._device_is_map8(device):
             map8_name = self._get_map8_parameter_display_name(parameter, device)
             if map8_name:
-                return self._remove_haptic_step_suffix(map8_name)
+                return self._remove_haptic_suffixes(map8_name)
         if self._device_is_rotomap16(device):
             rotomap16_name = self._get_rotomap16_parameter_display_name(parameter, device)
             if rotomap16_name:
-                return self._remove_haptic_step_suffix(rotomap16_name)
+                return self._remove_haptic_suffixes(rotomap16_name)
         if self._device_is_mapr16(device):
             mapr16_name = self._get_mapr16_parameter_display_name(parameter, device)
             if mapr16_name:
-                return self._remove_haptic_step_suffix(mapr16_name)
-        return self._remove_haptic_step_suffix(parameter.name)
+                return self._remove_haptic_suffixes(mapr16_name)
+        return self._remove_haptic_suffixes(parameter.name)
 
     def _get_parameter_mapping_override_name(self, parameter):
         for parameter_name in self._get_parameter_names(parameter):
             match = re.match(r'^RotoMap_(.+)$', parameter_name)
             if match:
-                return self._remove_haptic_step_suffix(match.group(1).strip())
+                return self._remove_haptic_suffixes(match.group(1).strip())
             match = re.match(r'^RotoParam(?:[1-9]|1[0-6])(?:_| )(.+)$', parameter_name)
             if match:
-                return self._remove_haptic_step_suffix(match.group(1).strip())
+                return self._remove_haptic_suffixes(match.group(1).strip())
         return None
 
     def _get_parameter_haptic_step_count(self, parameter, display_name_override = None):
@@ -2216,13 +2220,33 @@ class RotoControl(ControlSurface):
         parameter_names.extend(self._get_parameter_names(parameter))
 
         for parameter_name in parameter_names:
-            match = re.search(r'_Step([2-9]|1[0-9]|2[0-4])$', parameter_name, re.IGNORECASE)
+            match = re.search(r'_Step([2-9]|1[0-9]|2[0-4])(?:_Center)?$', parameter_name, re.IGNORECASE)
+            if not match:
+                match = re.search(r'_Center_Step([2-9]|1[0-9]|2[0-4])$', parameter_name, re.IGNORECASE)
             if match:
                 return int(match.group(1))
         return None
 
-    def _remove_haptic_step_suffix(self, parameter_name):
-        return re.sub(r'_Step(?:[2-9]|1[0-9]|2[0-4])$', '', parameter_name, flags=re.IGNORECASE).strip()
+    def _parameter_has_haptic_center_indent(self, parameter, display_name_override = None):
+        parameter_names = []
+        if display_name_override:
+            parameter_names.append(display_name_override)
+        parameter_names.extend(self._get_parameter_names(parameter))
+
+        for parameter_name in parameter_names:
+            if re.search(r'_Center(?:_Step(?:[2-9]|1[0-9]|2[0-4]))?$', parameter_name, re.IGNORECASE):
+                return True
+            if re.search(r'_Step(?:[2-9]|1[0-9]|2[0-4])_Center$', parameter_name, re.IGNORECASE):
+                return True
+        return False
+
+    def _remove_haptic_suffixes(self, parameter_name):
+        cleaned_parameter_name = parameter_name
+        while True:
+            next_parameter_name = re.sub(r'_(?:Step(?:[2-9]|1[0-9]|2[0-4])|Center)$', '', cleaned_parameter_name, flags=re.IGNORECASE)
+            if next_parameter_name == cleaned_parameter_name:
+                return cleaned_parameter_name.strip()
+            cleaned_parameter_name = next_parameter_name
 
     def _get_roto_param_slot(self, control_type, control_index):
         if control_type == 0:
@@ -2240,13 +2264,13 @@ class RotoControl(ControlSurface):
             for parameter_name in self._get_parameter_names(parameter):
                 match = re.match(r'^RotoParam{}(?:_| )(.+)$'.format(slot), parameter_name)
                 if match:
-                    display_name = self._remove_haptic_step_suffix(match.group(1).strip())
+                    display_name = self._remove_haptic_suffixes(match.group(1).strip())
                     if display_name:
                         return display_name
                 if parameter_name == 'RotoParam{}'.format(slot):
                     display_name = self._get_parameter_value_display(parameter)
                     if display_name:
-                        return self._remove_haptic_step_suffix(display_name)
+                        return self._remove_haptic_suffixes(display_name)
         return None
 
     def _get_rotomap16_parameter_display_name(self, parameter, device):
