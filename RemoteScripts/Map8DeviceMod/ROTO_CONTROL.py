@@ -215,6 +215,7 @@ class RotoControl(ControlSurface):
             self._update_listener_track_list = []
             self._last_detail_change_track_list = []
             self._detail_change_device_list = []
+            self._device_collapse_view_list = []
             self._group_track_timer_interval = 5        # Set timer interval (5 ticks = 0.5 second)
             self._visible_track_mask = 0
             self._current_track_mask = 0
@@ -633,6 +634,7 @@ class RotoControl(ControlSurface):
                 if self._device_is_macro_rack(device.class_name):
                     if not device.macros_mapped_has_listener(self._on_macro_map_changed):
                         device.add_macros_mapped_listener(self._on_macro_map_changed)
+                self._add_device_collapse_listener(device)
         else:
             for device in devices:
                 if device not in self._detail_change_device_list:
@@ -640,6 +642,7 @@ class RotoControl(ControlSurface):
                     device.add_name_listener(self._on_device_name_changed)
                     device.add_is_active_listener(self._on_device_is_active_changed)
                     device.add_parameters_listener(self._on_parameters_changed)
+                self._add_device_collapse_listener(device)
 
     def get_expanded_device_list(self):
         # Get the list of devices on the selected track including all chained and nested devices
@@ -656,6 +659,8 @@ class RotoControl(ControlSurface):
         # Recursively search for devices nested in any number of sub chains
         if device.can_have_chains:
             self._expanded_devices_list.append(device)
+            if not self._device_should_show_chain_devices(device):
+                return
             chains = device.chains
             if chains:
                 for chain in chains:
@@ -665,6 +670,44 @@ class RotoControl(ControlSurface):
                             self.traverse_chains(nested_device)
         else:
             self._expanded_devices_list.append(device)
+
+    def _device_should_show_chain_devices(self, device):
+        try:
+            device_view = getattr(device, 'view', None)
+            if device_view != None:
+                for visible_property_name in ['is_showing_chain_devices', 'is_showing_chain_list']:
+                    if hasattr(device_view, visible_property_name):
+                        return bool(getattr(device_view, visible_property_name))
+
+                if hasattr(device_view, 'is_collapsed'):
+                    return not bool(getattr(device_view, 'is_collapsed'))
+        except:
+            pass
+        return True
+
+    def _add_device_collapse_listener(self, device):
+        try:
+            device_view = getattr(device, 'view', None)
+            if device_view == None:
+                return
+
+            self._add_device_view_listener(device_view, 'is_collapsed')
+            self._add_device_view_listener(device_view, 'is_showing_chain_devices')
+            self._add_device_view_listener(device_view, 'is_showing_chain_list')
+        except:
+            pass
+
+    def _add_device_view_listener(self, device_view, property_name):
+        listener_key = (device_view, property_name)
+        if listener_key in self._device_collapse_view_list:
+            return
+
+        has_listener = getattr(device_view, '{}_has_listener'.format(property_name), None)
+        add_listener = getattr(device_view, 'add_{}_listener'.format(property_name), None)
+        if callable(add_listener):
+            if (not callable(has_listener)) or (not has_listener(self._on_device_collapsed_changed)):
+                add_listener(self._on_device_collapsed_changed)
+            self._device_collapse_view_list.append(listener_key)
 
     def _send_led_status(self, index, status, button_mode):
         if (self._mixer_button_mode == button_mode):
@@ -1161,7 +1204,7 @@ class RotoControl(ControlSurface):
             self._update_tracks_page_index()
             self._update_mixer()
             self.request_rebuild_midi_map()
-    def _learn_parameter(self, parameter, selected_device, index_override = PARAM_INDEX_NO_OVERRIDE, param_mapped = False, param_hash = PARAM_HASH_NO_OVERRIDE):
+    def _learn_parameter(self, parameter, selected_device, index_override = PARAM_INDEX_NO_OVERRIDE, param_mapped = False, param_hash = PARAM_HASH_NO_OVERRIDE, display_name_override = None):
         if (parameter != None) and (selected_device != None):
             # Search for the parameter in the current device. This sanity checks that the
             # parameter is in the selected device. Store the index of the device.
@@ -1195,7 +1238,10 @@ class RotoControl(ControlSurface):
                     quantised_strings = bytes(len(parameter.value_items) * MAX_STRING_LENGTH)
 
             # Truncate the parameter name if needed
-            param_name = self._get_parameter_display_name(parameter, selected_device)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
+            if display_name_override:
+                param_name = display_name_override[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
+            else:
+                param_name = self._get_parameter_display_name(parameter, selected_device)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
             # Get a hash (6 bytes) of the original name
             index_msb = (index & 0x3f80) >> 7
             index_lsb = index & 0x7f
@@ -1223,10 +1269,12 @@ class RotoControl(ControlSurface):
             data.extend(param_name.encode('utf-8'))
             data.extend(quantised_strings)
             self._send_sysex(PLUGIN_COMMAND_GROUP, LEARN_PARAM, data)
+            if display_name_override:
+                self._log_print('ROTO_DIAG_LEARN_PARAM_NAME name="{}" index={} macro_byte={}'.format(display_name_override, index, macro_byte))
         else:
             self._log_print('No parameter selected')
 
-    def _set_mapped_control_name(self, parameter, selected_device):
+    def _set_mapped_control_name(self, parameter, selected_device, display_name_override = None, index_override = PARAM_INDEX_NO_OVERRIDE, param_hash = PARAM_HASH_NO_OVERRIDE):
         if (parameter != None) and (selected_device != None):
             # Search for the parameter in the current device. This sanity checks that the
             # parameter is in the selected device. Store the index of the device.
@@ -1243,19 +1291,30 @@ class RotoControl(ControlSurface):
                 self._log_print('Parameter: {} not found in device: {}'.format(parameter.name, selected_device.name))
                 return
 
+            if index_override != PARAM_INDEX_NO_OVERRIDE:
+                index = index_override
+
             # Create the data structure to return to the device
-            param_name = self._get_parameter_display_name(parameter, selected_device)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
+            if display_name_override:
+                param_name = display_name_override[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
+            else:
+                param_name = self._get_parameter_display_name(parameter, selected_device)[:(MAX_STRING_LENGTH - 1)].ljust(MAX_STRING_LENGTH, '\x00')
             # Get a hash (6 bytes) of the original name
             index_msb = (index & 0x3f80) >> 7
             index_lsb = index & 0x7f
 
             param_learn_name = self._get_learn_name(parameter, False, selected_device)
 
-            plugin_digest = self._get_param_hash(param_learn_name)
+            if param_hash == PARAM_HASH_NO_OVERRIDE:
+                plugin_digest = self._get_param_hash(param_learn_name)
+            else:
+                plugin_digest = param_hash
             data = bytearray([index_msb, index_lsb])
             data.extend(plugin_digest)
             data.extend(param_name.encode('utf-8'))
             self._send_sysex(PLUGIN_COMMAND_GROUP, SET_MAPPED_CTL_NAME, data)
+            if display_name_override:
+                self._log_print('ROTO_DIAG_SET_MAPPED_CTL_NAME name="{}" index={}'.format(display_name_override, index))
         else:
             self._log_print('No parameter selected')
 
@@ -1391,6 +1450,9 @@ class RotoControl(ControlSurface):
 
     def _on_parameters_changed(self):
         self._RotoControl__on_selected_device_changed()
+
+    def _on_device_collapsed_changed(self):
+        self._update_devices()
 
     def _on_macro_map_changed(self):
         # Only run this if the selected device is a rack to avoid unneccessary updates
@@ -1660,6 +1722,11 @@ class RotoControl(ControlSurface):
                     for ix in range(2, 8):
                         param_hash.append(data[ix])
 
+                    roto_param_slot = self._get_roto_param_slot(data[8], data[9])
+                    roto_param_display_name = self._get_roto_param_display_name(selected_device, data[8], data[9])
+                    if roto_param_display_name:
+                        self._log_print('ROTO_DIAG_CONTROL_MAPPED control_type={} control_index={} roto_param_name="{}" param_index={}'.format(data[8], data[9], roto_param_display_name, param_index))
+
                     device_is_learnt_rack = False
                     if self._device_is_macro_rack(selected_device.class_name) and (data[10] == 0): # (data[10] == 0) ==> Current param is not a macro
                         device_is_learnt_rack = True
@@ -1695,7 +1762,7 @@ class RotoControl(ControlSurface):
                                     param = selected_device.parameters[param_index]
                                     # Send the position data for knobs
                                     if (param != None) and (data[8] == 0):
-                                        self._learn_parameter(param, selected_device, param_index)
+                                        self._learn_parameter(param, selected_device, param_index, False, PARAM_HASH_NO_OVERRIDE)
                                 else:
                                     param_index = None
                             else:
@@ -1751,6 +1818,16 @@ class RotoControl(ControlSurface):
 
                         if param_mapped:
                             self._add_value_listener(param, data[9], data[8], param_index)
+                            if roto_param_display_name:
+                                if roto_param_slot != None:
+                                    mapped_name_index = roto_param_slot - 1
+                                    mapped_name_hash = self._get_param_hash(str(roto_param_slot))
+                                    self._log_print('ROTO_DIAG_ROTO_PARAM_TARGET slot={} hardware_index={}'.format(roto_param_slot, mapped_name_index))
+                                else:
+                                    mapped_name_index = param_index_original
+                                    mapped_name_hash = param_hash
+                                self._learn_parameter(param, selected_device, mapped_name_index, True, mapped_name_hash, roto_param_display_name)
+                                self._set_mapped_control_name(param, selected_device, roto_param_display_name, mapped_name_index, mapped_name_hash)
 
                     else:
                         param_valid = False
@@ -2120,6 +2197,34 @@ class RotoControl(ControlSurface):
             match = re.match(r'^RotoMap_(.+)$', parameter_name)
             if match:
                 return match.group(1).strip()
+            match = re.match(r'^RotoParam(?:[1-9]|1[0-6])(?:_| )(.+)$', parameter_name)
+            if match:
+                return match.group(1).strip()
+        return None
+
+    def _get_roto_param_slot(self, control_type, control_index):
+        if control_type == 0:
+            return control_index + 1
+        elif control_type == 1:
+            return control_index + 9
+        return None
+
+    def _get_roto_param_display_name(self, device, control_type, control_index):
+        slot = self._get_roto_param_slot(control_type, control_index)
+        if slot == None:
+            return None
+
+        for parameter in device.parameters:
+            for parameter_name in self._get_parameter_names(parameter):
+                match = re.match(r'^RotoParam{}(?:_| )(.+)$'.format(slot), parameter_name)
+                if match:
+                    display_name = match.group(1).strip()
+                    if display_name:
+                        return display_name
+                if parameter_name == 'RotoParam{}'.format(slot):
+                    display_name = self._get_parameter_value_display(parameter)
+                    if display_name:
+                        return display_name
         return None
 
     def _get_rotomap16_parameter_display_name(self, parameter, device):
